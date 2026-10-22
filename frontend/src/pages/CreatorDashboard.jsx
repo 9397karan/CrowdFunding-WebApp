@@ -27,7 +27,26 @@ function CreatorDashboard() {
     const activeProjects = projects.filter(
         project => project.currentAmount < project.goalAmount
     ).length;
+const deleteProject = async (id) => {
+    const confirmDelete = window.confirm(
+        "Are you sure you want to delete this project?"
+    );
 
+    if (!confirmDelete) return;
+
+    try {
+        await api.delete(`/projects/${id}`);
+
+        setProjects((prevProjects) =>
+            prevProjects.filter((project) => project.id !== id)
+        );
+
+        alert("Project deleted successfully!");
+    } catch (error) {
+        console.error("Delete error:", error);
+        alert("Failed to delete project. Please try again.");
+    }
+};
     return (
 
         <div className="max-w-7xl mx-auto p-6">
@@ -187,13 +206,18 @@ function CreatorDashboard() {
                                             </button>
                                         </Link>
 
-                                        <button className="bg-yellow-500 text-white px-4 py-2 rounded">
-                                            Edit
-                                        </button>
+                                       <Link
+    to={`/edit-project/${project.id}`}
+    className="bg-yellow-500 hover:bg-yellow-600 text-white px-4 py-2 rounded"
+>
+    Edit
+</Link> <button
+    onClick={() => deleteProject(project.id)}
+    className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded"
+>
+    Delete
+</button>
 
-                                        <button className="bg-red-600 text-white px-4 py-2 rounded">
-                                            Delete
-                                        </button>
 
                                     </div>
 

@@ -1,316 +1,362 @@
+
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { Calendar, Users, ArrowLeft, TrendingUp } from "lucide-react";
 import api from "../service/api";
 import ProjectCard from "../component/ProjectCard";
+import DonationReceipt from "../component/DonationReceipt";
 
-function ProjectDetails() {
-
+export default function ProjectDetails() {
     const { id } = useParams();
+    const user = JSON.parse(localStorage.getItem("user") || "null");
 
     const [project, setProject] = useState(null);
     const [projects, setProjects] = useState([]);
     const [contributions, setContributions] = useState([]);
     const [amount, setAmount] = useState("");
+    const [receipt, setReceipt] = useState(null);
     const [loading, setLoading] = useState(true);
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState("");
 
-    const user = JSON.parse(localStorage.getItem("user"));
+    const loadData = async () => {
+        try {
+            const [p, c, all] = await Promise.all([
+                api.get(`/projects/${id}`),
+                api.get(`/contributions/project/${id}`),
+                api.get("/projects")
+            ]);
+
+            setProject(p.data);
+            setContributions(c.data);
+            setProjects(all.data.filter(x => x.id != id).slice(0, 3));
+        } catch {
+            setError("Unable to load project details.");
+        } finally {
+            setLoading(false);
+        }
+    };
 
     useEffect(() => {
         setLoading(true);
-        Promise.all([loadProject(), loadContributions(), loadProjects()])
-            .finally(() => setLoading(false));
+        loadData();
     }, [id]);
 
-    const loadProject = async () => {
-        const res = await api.get(`/projects/${id}`);
-        setProject(res.data);
-    };
+    const goal = Number(project?.goalAmount || 0);
+    const collected = Number(project?.currentAmount || 0);
+    const remaining = Math.max(0, goal - collected);
+    const percentage = goal ? Math.min(collected / goal * 100, 100) : 0;
 
-    const loadContributions = async () => {
-        const res = await api.get(`/contributions/project/${id}`);
-        setContributions(res.data);
-    };
-
-    const loadProjects = async () => {
-        const res = await api.get("/projects");
-        setProjects(res.data.filter(p => p.id != id).slice(0, 3));
-    };
+    const daysLeft = project?.deadline
+        ? Math.ceil((new Date(project.deadline) - new Date()) / 86400000)
+        : null;
 
     const contribute = async () => {
         setError("");
 
-        if (!user) {
-            setError("Please login to contribute.");
-            return;
-        }
+        const donation = Number(amount);
 
-        if (user.role === "CREATOR") {
-            setError("Creators cannot contribute.");
-            return;
-        }
+        if (!user) return setError("Please login to contribute.");
+        if (user.role !== "BACKER")
+            return setError("Only backers can contribute.");
+        if (!amount || !Number.isFinite(donation) || donation < 1)
+            return setError("Enter a valid donation amount of at least ₹1.");
+        if (remaining <= 0)
+            return setError("This project has reached its funding goal.");
+        if (donation > remaining)
+            return setError(`Maximum donation allowed: ₹${remaining.toLocaleString("en-IN")}.`);
 
-        if (!amount || amount <= 0) {
-            setError("Enter a valid amount.");
-            return;
-        }
+        setSubmitting(true);
 
         try {
-            setSubmitting(true);
+            if (!window.Razorpay) {
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement("script");
+                    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+                    script.onload = resolve;
+                    script.onerror = () => reject(
+                        new Error("Unable to load Razorpay.")
+                    );
+                    document.body.appendChild(script);
+                });
+            }
 
-            await api.post("/contributions", {
-                amount,
-                project: { id },
-                user: { id: user.id }
+            // Fetch the latest project amount before creating the order.
+            const latest = (await api.get(`/projects/${id}`)).data;
+            const latestRemaining = Math.max(
+                0,
+                Number(latest.goalAmount) - Number(latest.currentAmount || 0)
+            );
+
+            setProject(latest);
+
+            if (latestRemaining <= 0 || donation > latestRemaining) {
+                throw new Error(
+                    latestRemaining <= 0
+                        ? "This project has reached its funding goal."
+                        : `Only ₹${latestRemaining.toLocaleString("en-IN")} remains. Enter a lower amount.`
+                );
+            }
+
+            const order = (await api.post("/payments/create-order", {
+                projectId: Number(id),
+                userId: user.id,
+                amountPaise: Math.round(donation * 100)
+            })).data;
+
+            const checkout = new window.Razorpay({
+                key: order.keyId,
+                amount: order.amount,
+                currency: order.currency,
+                order_id: order.orderId,
+                name: "CrowdFunding",
+                description: latest.title,
+
+                handler: async response => {
+                    try {
+                        // Verify payment with the backend first.
+                        await api.post("/payments/verify", {
+                            razorpayOrderId: response.razorpay_order_id,
+                            razorpayPaymentId: response.razorpay_payment_id,
+                            razorpaySignature: response.razorpay_signature
+                        });
+
+                        // Show receipt only after successful verification.
+                        setReceipt({
+                            donorName: user.name || "Donor",
+                            projectName: latest.title,
+                            amount: donation,
+                            date: new Date().toISOString(),
+                            paymentId: response.razorpay_payment_id
+                        });
+
+                        setAmount("");
+                        setError("");
+                        await loadData();
+                    } catch (err) {
+                        setError(
+                            err.response?.data?.message ||
+                            "Payment verification failed. Contact support before retrying."
+                        );
+                    } finally {
+                        setSubmitting(false);
+                    }
+                },
+
+                modal: {
+                    ondismiss: () => setSubmitting(false)
+                },
+
+                theme: { color: "#4f46e5" }
             });
 
-            setAmount("");
-            await Promise.all([loadProject(), loadContributions()]);
+            checkout.on("payment.failed", response => {
+                setError(
+                    response.error?.description ||
+                    "Payment failed. Please try again."
+                );
+                setSubmitting(false);
+            });
 
+            checkout.open();
         } catch (err) {
-            setError("Something went wrong. Please try again.");
-        } finally {
+            setError(
+                err.response?.data?.message ||
+                err.message ||
+                "Payment could not be started."
+            );
             setSubmitting(false);
         }
     };
 
-    const daysLeft = (deadline) => {
-        if (!deadline) return null;
-        const diff = Math.ceil((new Date(deadline) - new Date()) / (1000 * 60 * 60 * 24));
-        return diff;
-    };
+    if (loading)
+        return <div className="p-10 text-center">Loading project...</div>;
 
-    const formatDate = (deadline) => {
-        if (!deadline) return "—";
-        return new Date(deadline).toLocaleDateString("en-IN", {
-            day: "numeric", month: "short", year: "numeric"
-        });
-    };
-
-    if (loading) {
+    if (!project)
         return (
-            <div className="bg-gray-50 min-h-screen animate-pulse">
-                <div className="w-full h-72 sm:h-96 bg-gray-200" />
-                <div className="max-w-6xl mx-auto p-6 space-y-4">
-                    <div className="h-8 bg-gray-200 rounded w-1/2" />
-                    <div className="h-4 bg-gray-200 rounded w-1/4" />
-                    <div className="h-32 bg-gray-200 rounded mt-6" />
-                </div>
+            <div className="p-10 text-center">
+                Project not found. <Link to="/">Go Home</Link>
             </div>
         );
-    }
 
-    if (!project) {
-        return (
-            <div className="min-h-screen flex items-center justify-center text-center px-4">
-                <div>
-                    <h2 className="text-xl font-semibold text-gray-800">Project not found</h2>
-                    <Link to="/" className="text-indigo-600 text-sm mt-2 inline-block hover:underline">
-                        ← Back to all projects
-                    </Link>
-                </div>
-            </div>
-        );
-    }
-
-    const percentage = Math.min(
-        (project.currentAmount / project.goalAmount) * 100,
-        100
-    );
-
-    const remaining = daysLeft(project.deadline);
-const imageUrl = `https://picsum.photos/seed/${project.category}-${project.id}/600/400`;
     return (
+        <div className="min-h-screen bg-gray-50">
+            
+{receipt && (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <div className="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl">
+            <DonationReceipt
+                donation={receipt}
+                onClose={() => setReceipt(null)}
+            />
+        </div>
+    </div>
+)}
 
-        <div className="bg-gray-50 min-h-screen">
 
             <div className="relative">
                 <img
-    src={imageUrl}
-    alt={project.title}
-    className="w-full h-52 object-cover rounded-t-xl"
-/>
-
-                <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent" />
+                    src={`https://picsum.photos/seed/${project.category}-${project.id}/1200/500`}
+                    alt={project.title}
+                    className="w-full h-64 sm:h-80 object-cover"
+                />
                 <Link
                     to="/"
-                    className="absolute top-4 left-4 flex items-center gap-1.5 bg-white/90 backdrop-blur px-3 py-1.5 rounded-full text-sm font-medium text-gray-700 hover:bg-white transition"
+                    className="absolute top-4 left-4 bg-white rounded-full px-4 py-2 flex gap-2"
                 >
-                    <ArrowLeft className="w-4 h-4" />
-                    Back
+                    <ArrowLeft size={18} /> Back
                 </Link>
             </div>
 
-            <div className="max-w-6xl mx-auto p-4 sm:p-6">
+            <main className="max-w-6xl mx-auto p-6 grid lg:grid-cols-3 gap-8">
+                <section className="lg:col-span-2 space-y-6">
+                    <div>
+                        <span className="text-indigo-600 font-semibold">
+                            {project.category}
+                        </span>
+                        <h1 className="text-3xl font-bold mt-2">
+                            {project.title}
+                        </h1>
+                        <p className="text-gray-500 mt-2">
+                            Created by {project.creator?.name}
+                        </p>
+                    </div>
 
-                <div className="grid lg:grid-cols-3 gap-8">
+                    <div className="bg-white rounded-xl shadow p-6">
+                        <h2 className="text-xl font-bold">About this project</h2>
+                        <p className="text-gray-600 mt-3 whitespace-pre-line">
+                            {project.description}
+                        </p>
+                    </div>
 
-                    {/* Main content */}
-                    <div className="lg:col-span-2 space-y-6">
+                    <div className="bg-white rounded-xl shadow p-6">
+                        <h2 className="text-xl font-bold flex gap-2 items-center">
+                            <Users size={20} /> Recent Contributions
+                        </h2>
 
-                        <div>
-                            <span className="inline-block text-xs font-semibold px-2.5 py-1 rounded-full bg-indigo-100 text-indigo-700 mb-3">
-                                {project.category}
+                        {contributions.length ? contributions.map(c => (
+                            <div key={c.id} className="flex justify-between border-b py-3">
+                                <span>{c.user?.name}</span>
+                                <b>₹{Number(c.amount).toLocaleString("en-IN")}</b>
+                            </div>
+                        )) : (
+                            <p className="text-gray-500 mt-3">
+                                Be the first to support this project.
+                            </p>
+                        )}
+                    </div>
+                </section>
+
+                <aside>
+                    <div className="bg-white rounded-xl shadow p-6 space-y-5 lg:sticky lg:top-6">
+                        <div className="flex justify-between items-baseline">
+                            <b className="text-2xl">
+                                ₹{collected.toLocaleString("en-IN")}
+                            </b>
+                            <span className="text-gray-500">
+                                of ₹{goal.toLocaleString("en-IN")}
                             </span>
-                            <h1 className="text-2xl sm:text-4xl font-bold text-gray-900">
-                                {project.title}
-                            </h1>
-                            <p className="text-gray-500 mt-2 text-sm">
-                                Created by <span className="font-semibold text-gray-700">{project.creator?.name}</span>
+                        </div>
+
+                        <div className="h-3 bg-gray-200 rounded-full">
+                            <div
+                                className="h-3 bg-green-500 rounded-full"
+                                style={{ width: `${percentage}%` }}
+                            />
+                        </div>
+
+                        <div className="flex justify-between text-sm">
+                            <span className="text-green-600 flex gap-1">
+                                <TrendingUp size={16} />
+                                {percentage.toFixed(0)}% funded
+                            </span>
+                            <span className="text-gray-500 flex gap-1">
+                                <Calendar size={16} />
+                                {daysLeft > 0 ? `${daysLeft} days left` : "Ended"}
+                            </span>
+                        </div>
+
+                        <p className="text-xs text-gray-400">
+                            Deadline: {project.deadline || "—"}
+                        </p>
+
+                        <div className="bg-indigo-50 rounded-lg p-3">
+                            <p className="text-sm text-gray-600">Remaining goal</p>
+                            <b className="text-xl text-indigo-700">
+                                ₹{remaining.toLocaleString("en-IN")}
+                            </b>
+                        </div>
+
+                        <hr />
+                        <h3 className="font-semibold">Support this project</h3>
+
+                        {error && (
+                            <p className="text-sm text-red-600" role="alert">
+                                {error}
                             </p>
-                        </div>
+                        )}
 
-                        <div className="bg-white rounded-xl shadow p-6">
-                            <h2 className="text-xl font-bold text-gray-900">About this project</h2>
-                            <p className="mt-3 text-gray-600 leading-7 whitespace-pre-line">
-                                {project.description}
+                        {!user ? (
+                            <Link
+                                to="/login"
+                                className="block text-center bg-indigo-600 text-white p-3 rounded-lg"
+                            >
+                                Login to contribute
+                            </Link>
+                        ) : user.role !== "BACKER" ? (
+                            <p className="text-gray-500 text-sm">
+                                Only backers can contribute.
                             </p>
-                        </div>
+                        ) : remaining <= 0 ? (
+                            <p className="text-green-700 font-semibold">
+                                Funding goal reached!
+                            </p>
+                        ) : (
+                            <>
+                                <input
+                                    type="number"
+                                    min="1"
+                                    max={remaining}
+                                    step="1"
+                                    value={amount}
+                                    onChange={e => {
+                                        setAmount(e.target.value);
+                                        setError("");
+                                    }}
+                                    placeholder="Enter amount in ₹"
+                                    className="w-full border p-3 rounded-lg"
+                                />
 
-                        <div className="bg-white rounded-xl shadow p-6">
-                            <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2">
-                                <Users className="w-5 h-5 text-gray-400" />
-                                Recent Contributions
-                            </h2>
-
-                            {contributions.length === 0 ? (
-                                <p className="mt-4 text-sm text-gray-500">Be the first to support this project.</p>
-                            ) : (
-                                <div className="mt-4 divide-y divide-gray-100">
-                                    {contributions.map(c => (
-                                        <div key={c.id} className="flex items-center justify-between py-3">
-                                            <div className="flex items-center gap-3">
-                                                <span className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 text-xs font-bold flex items-center justify-center flex-shrink-0">
-                                                    {c.user?.name?.slice(0, 2).toUpperCase()}
-                                                </span>
-                                                <span className="text-sm font-medium text-gray-700">{c.user?.name}</span>
-                                            </div>
-                                            <span className="text-sm font-semibold text-gray-900">
-                                                ₹{Number(c.amount).toLocaleString()}
-                                            </span>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-
+                                <button
+                                    onClick={contribute}
+                                    disabled={
+                                        submitting ||
+                                        !amount ||
+                                        Number(amount) < 1 ||
+                                        Number(amount) > remaining
+                                    }
+                                    className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white p-3 rounded-lg"
+                                >
+                                    {submitting ? "Processing..." : "Contribute"}
+                                </button>
+                            </>
+                        )}
                     </div>
+                </aside>
 
-                    {/* Sidebar */}
-                    <div className="lg:col-span-1">
-                        <div className="bg-white rounded-xl shadow p-6 lg:sticky lg:top-6 space-y-5">
-
-                            <div>
-                                <div className="flex items-baseline justify-between">
-                                    <span className="text-2xl font-bold text-gray-900">
-                                        ₹{project.currentAmount.toLocaleString()}
-                                    </span>
-                                    <span className="text-sm text-gray-500">
-                                        of ₹{project.goalAmount.toLocaleString()}
-                                    </span>
-                                </div>
-
-                                <div className="w-full bg-gray-200 rounded-full h-3 mt-3">
-                                    <div
-                                        className="bg-green-500 h-3 rounded-full transition-all duration-300"
-                                        style={{ width: `${percentage}%` }}
-                                    />
-                                </div>
-
-                                <div className="flex items-center justify-between mt-2 text-sm">
-                                    <span className="flex items-center gap-1 text-green-600 font-medium">
-                                        <TrendingUp className="w-3.5 h-3.5" />
-                                        {percentage.toFixed(0)}% Funded
-                                    </span>
-                                    {remaining !== null && (
-                                        <span className="flex items-center gap-1 text-gray-500">
-                                            <Calendar className="w-3.5 h-3.5" />
-                                            {remaining > 0 ? `${remaining} days left` : "Ended"}
-                                        </span>
-                                    )}
-                                </div>
-
-                                <p className="text-xs text-gray-400 mt-1">
-                                    Deadline: {formatDate(project.deadline)}
-                                </p>
-                            </div>
-
-                            <div className="border-t border-gray-100 pt-5">
-                                <h3 className="font-semibold text-gray-900 mb-3">Support this project</h3>
-
-                                {error && (
-                                    <div className="bg-red-50 border border-red-200 text-red-600 text-xs rounded-lg px-3 py-2 mb-3">
-                                        {error}
-                                    </div>
-                                )}
-
-                                {!user ? (
-                                    <>
-                                        <p className="text-sm text-gray-500 mb-3">Please login to contribute.</p>
-                                        <Link to="/login">
-                                            <button className="w-full bg-indigo-600 text-white py-2.5 rounded-lg hover:bg-indigo-700 transition font-medium text-sm">
-                                                Login
-                                            </button>
-                                        </Link>
-                                    </>
-                                ) : user.role === "CREATOR" ? (
-                                    <p className="text-sm text-gray-500">Creators cannot contribute.</p>
-                                ) : (
-                                    <>
-                                        <div className="relative mb-3">
-                                            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">₹</span>
-                                            <input
-                                                type="number"
-                                                placeholder="Enter amount"
-                                                min="1"
-                                                className="border border-gray-200 w-full pl-7 pr-3 py-2.5 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition"
-                                                value={amount}
-                                                onChange={(e) => setAmount(e.target.value)}
-                                            />
-                                        </div>
-                                        <button
-                                            onClick={contribute}
-                                            disabled={submitting}
-                                            className="w-full bg-indigo-600 text-white py-2.5 rounded-lg hover:bg-indigo-700 transition font-medium text-sm disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                                        >
-                                            {submitting ? (
-                                                <>
-                                                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
-                                                    Processing...
-                                                </>
-                                            ) : (
-                                                "Contribute"
-                                            )}
-                                        </button>
-                                    </>
-                                )}
-                            </div>
-
-                        </div>
-                    </div>
-
-                </div>
-
-                {/* Related projects */}
                 {projects.length > 0 && (
-                    <div className="mt-14">
-                        <h2 className="text-xl font-bold text-gray-900 mb-5">More projects to explore</h2>
+                    <section className="lg:col-span-3">
+                        <h2 className="text-xl font-bold mb-5">
+                            More projects to explore
+                        </h2>
                         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
                             {projects.map(p => (
                                 <ProjectCard key={p.id} project={p} />
                             ))}
                         </div>
-                    </div>
+                    </section>
                 )}
-
-            </div>
-
+            </main>
         </div>
-
     );
-
 }
-
-export default ProjectDetails;
